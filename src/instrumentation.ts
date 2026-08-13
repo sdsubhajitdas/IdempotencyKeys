@@ -10,6 +10,11 @@ export interface RoundTripCounter {
  * that uses it knowing instrumentation exists. One generic proxy instead
  * of manual bookkeeping scattered through every strategy, since a round
  * trip is a round trip regardless of which command caused it.
+ *
+ * Needs both a `get` trap (for RedisClient-style `client.method(...)`
+ * calls) and an `apply` trap (for Bun's SQL, which is itself callable —
+ * `` sql`SELECT ...` `` is a direct invocation of the proxy, not a
+ * property access, so a `get`-only proxy silently misses it).
  */
 export function createCountingProxy<T extends object>(target: T, counter: RoundTripCounter): T {
   return new Proxy(target, {
@@ -22,6 +27,10 @@ export function createCountingProxy<T extends object>(target: T, counter: RoundT
         counter.count++;
         return value.apply(obj, args);
       };
+    },
+    apply(fn, thisArg, args) {
+      counter.count++;
+      return Reflect.apply(fn as (...a: unknown[]) => unknown, thisArg, args);
     },
   });
 }

@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      REDIS_URL: redis://localhost:6379
+      DATABASE_URL: postgres://idempotency:idempotency@localhost:5432/idempotency
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: idempotency
+          POSTGRES_PASSWORD: idempotency
+          POSTGRES_DB: idempotency
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U idempotency"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run typecheck
+
+      - run: bun run test

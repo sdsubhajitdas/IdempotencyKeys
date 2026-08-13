@@ -22,8 +22,8 @@ bun test tests/               # or: bun run test — the whole phase progression
 bun run test:watch            # watch mode
 bun run demo                  # demo HTTP server
 bun run dev                   # demo server with --hot
-bun run compare               # runs every strategy through identical workloads, prints a table
-bun run bench                 # latency-overhead benchmark harness
+bun run compare               # duplicate-charge audit + concurrency-sweep latency overhead + key growth
+bun run bench                 # sequential ops/sec per strategy, one connection, no concurrency
 ```
 
 Run a single test file: `bun test tests/phase2-set-nx-claim.test.ts`.
@@ -90,7 +90,23 @@ distribution, and per-call latency (`Bun.nanoseconds()`). Store
 round-trips are counted separately via `createCountingProxy`, which wraps
 a strategy's `RedisClient`/`SQL` instance in a `Proxy` that increments a
 shared counter on every method call — instrumentation never has to know
-which store or which commands a given strategy uses.
+which store or which commands a given strategy uses. The proxy needs
+both a `get` trap (`redis.method(...)`) and an `apply` trap: `Bun.sql`'s
+client is itself callable (`` sql`SELECT ...` `` is a tagged-template
+call directly on the object, not a property access), so a `get`-only
+proxy silently undercounts Postgres round trips — found by comparing
+`harness/compare.ts`'s printed round-trip counts against the number of
+queries each strategy actually issues.
+
+**Postgres claim is one round trip, not two** (`postgres-transactional.ts`'s
+`tryClaim`): a single CTE attempts the `INSERT ... ON CONFLICT` and falls
+back to reading the existing row in one statement, rather than an INSERT
+then a separate SELECT. An earlier two-round-trip version duplicate-charged
+under real 50-concurrent load — connection-pool queueing delay on the
+second round trip was enough for some requests' staleness check to see a
+claim that was only milliseconds old and, by wall-clock time alone, look
+abandoned. `src/db/client.ts` also sizes the connection pool (`max: 30`)
+for this repo's own concurrency rather than Bun's default of 10.
 
 ## Conventions
 

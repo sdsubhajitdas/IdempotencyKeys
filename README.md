@@ -14,9 +14,9 @@ runner, Redis client, Postgres client, TypeScript execution, and demo
 HTTP server are all Bun built-ins. Built and verified against Bun 1.3.14
 (as of 2026-08).
 
-> This README is written phase-by-phase as the repo is built. Sections
-> below fill in as each phase lands; see `CLAUDE.md` for the current
-> architecture snapshot.
+This README is the progression itself: the baseline failure, why each
+fix is necessary given the specific failure of the stage before it, and
+what each fix costs. See `CLAUDE.md` for the architecture snapshot.
 
 ## Phase 0 — the baseline failure
 
@@ -174,6 +174,73 @@ worth naming rather than quietly fixing:
   itself, not just by a genuine crash — worth knowing about in
   production, not just in a demo.
 
+## Phase 5 — comparison harness + benchmarks
+
+Two commands run every strategy through identical workloads:
+
+```
+bun run compare   # correctness + latency + round-trips + key growth, across all five
+bun run bench     # sequential ops/sec per strategy (bench/RESULTS.md has a captured run)
+```
+
+**Duplicate-charge audit** (50 concurrent identical requests, one shared
+key, per strategy) — the whole series in one table:
+
+| strategy               | charges (of 50) |
+| ----------------------- | ---------------- |
+| none                     | 50                |
+| naive-check-then-set     | 50                |
+| set-nx-claim             | 1                 |
+| lifecycle (Redis)        | 1                 |
+| postgres-transactional   | 1                 |
+
+**Latency overhead vs. baseline**, independent keys (no collisions,
+steady-state cost), swept across concurrency levels:
+
+| strategy               | concurrency | round-trips/req | p50 ms | p95 ms | p99 ms | overhead vs. `none` (p50) |
+| ----------------------- | ----------- | ---------------- | ------ | ------ | ------ | -------------------------- |
+| none                     | 50          | 0.0               | 0.03   | 0.04   | 0.05   | +0.00                       |
+| naive-check-then-set     | 50          | 2.0               | 0.87   | 0.96   | 0.96   | +0.84                       |
+| set-nx-claim             | 50          | 2.0               | 1.20   | 1.21   | 1.21   | +1.17                       |
+| lifecycle (Redis)        | 50          | 2.0               | 1.65   | 1.78   | 1.78   | +1.62                       |
+| postgres-transactional   | 50          | 2.0               | 14.44  | 18.58  | 18.95  | +14.41                      |
+
+Postgres's gap widens with concurrency — its p50 goes from ~2.8ms at
+concurrency 1 to ~14ms at concurrency 50 (transaction/WAL overhead per
+round trip, not more round trips: it stays at 2 round trips/request
+throughout). Redis-backed strategies stay under 2ms even at concurrency
+50. Full sweep (concurrency 1/10/25/50) and the key-growth measurement
+in `bun run compare`'s own output; a captured `bun run bench` snapshot
+(sequential, single-connection ops/sec) is in
+[`bench/RESULTS.md`](bench/RESULTS.md).
+
+**Key growth**: with default settings, a completed/failed key retains
+for `retentionSec` (24h, matching Stripe's default retention window); a
+pending claim self-heals after `leaseMs` (Redis, 30s default) or
+`staleAfterMs` (Postgres, 30s default) regardless of whether it ever
+completes. Nothing here currently caps total key volume within that
+window under sustained load — see **What this repo does not solve**.
+
+## Comparing against Stripe's idempotency keys
+
+The `lifecycle` (Redis) strategy is deliberately shaped to match how
+Stripe's real idempotency keys behave, so the mapping onto a system most
+readers already know is direct:
+
+| behavior                          | Stripe                          | this repo (`lifecycle`)         |
+| ---------------------------------- | -------------------------------- | --------------------------------- |
+| Concurrent request, same key       | `409` while the original is in flight | `409` + `Retry-After` (`claim.lua`'s `PENDING` branch) |
+| Retry after success                | Replays the original response, same status code | Replays verbatim (`COMPLETED` branch) |
+| Same key, different request body   | Rejected (`400`-class error)     | `422` (`MISMATCH` branch, fingerprint check) |
+| Retention window                   | 24 hours                         | `retentionSec`, default 24h        |
+| Failed request retry               | Key is retryable                 | `FAILED` is retryable by default (documented policy, see Phase 3) |
+
+The gap Stripe closes that this repo can't, by construction: Stripe
+*is* the payment gateway, so its idempotency key check and the actual
+charge happen inside the same system, not across a demo's mock boundary.
+That's exactly why Phase 4 exists — to show what's still true even when
+you don't get to make that assumption.
+
 ## What this repo does not solve
 
 Honest gaps, not papered over — each a candidate for a future post:
@@ -240,13 +307,15 @@ curl -X POST localhost:3000/payments \
 ```
 src/strategies/     one file per phase's strategy, each implementing IdempotencyStrategy
 src/gateway/        the one mock — PaymentGateway and its ledger
-src/redis/          Lua scripts + the EVALSHA-based script loader (added in Phase 3)
-src/db/             Postgres schema + client (added in Phase 4)
+src/redis/          Lua scripts + the EVALSHA-based script loader (Phase 3)
+src/db/             Postgres schema + client (Phase 4)
+src/fingerprint.ts   request-body hashing for the same-key-different-body check
 src/instrumentation.ts   round-trip/status/latency instrumentation wrapper
 demo/                the demo HTTP server (Bun.serve)
-harness/             concurrent-request firing + cross-strategy comparison
-bench/               benchmark harness + captured results
-tests/               the full phase progression, one suite
+harness/fire.ts       fires N concurrent identical requests, reports the resulting charge count
+harness/compare.ts    runs every strategy through identical workloads, prints the tables above
+bench/               sequential ops/sec benchmark harness + captured results (RESULTS.md)
+tests/               the full phase progression, one suite (bun test tests/)
 ```
 
 ## Requirements
