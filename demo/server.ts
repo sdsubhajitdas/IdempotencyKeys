@@ -4,6 +4,8 @@ import { NoIdempotency } from "../src/strategies/no-idempotency";
 import { NaiveCheckThenSet } from "../src/strategies/naive-check-then-set";
 import { SetNxClaim } from "../src/strategies/set-nx-claim";
 import { LifecycleRedis } from "../src/strategies/lifecycle";
+import { PostgresTransactional } from "../src/strategies/postgres-transactional";
+import { createSql, ensureSchema } from "../src/db/client";
 import type { IdempotencyStrategy, PaymentRequest } from "../src/types";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -12,6 +14,8 @@ const DEFAULT_STRATEGY = process.env.IDEMPOTENCY_STRATEGY ?? "lifecycle";
 
 const gateway = new PaymentGateway();
 const redis = new RedisClient(REDIS_URL);
+const sql = createSql();
+await ensureSchema(sql);
 
 // More strategies are registered here as later phases land — the demo
 // server only ever grows this map, never branches on strategy identity.
@@ -20,6 +24,7 @@ const strategies: Record<string, IdempotencyStrategy> = {
   naive: new NaiveCheckThenSet(redis, gateway, { prefix: "demo:naive" }),
   "set-nx": new SetNxClaim(redis, gateway, { prefix: "demo:setnx" }),
   lifecycle: new LifecycleRedis(redis, gateway, { prefix: "demo:lifecycle" }),
+  postgres: new PostgresTransactional(sql, gateway),
 };
 
 function isPaymentRequest(value: unknown): value is PaymentRequest {
