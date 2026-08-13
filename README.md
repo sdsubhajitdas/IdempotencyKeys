@@ -83,6 +83,47 @@ Both flaws come from the same root cause: claiming and completing are
 two separate writes with nothing connecting them. Phase 3 fixes this
 with a leased, three-state lifecycle instead of a single claim marker.
 
+## Phase 3 — the fix: a leased, three-state lifecycle
+
+`src/strategies/lifecycle.ts` replaces the single claim marker with a
+proper state machine — `NEW -> PENDING -> COMPLETED | FAILED` — backed
+by two Lua scripts run atomically via `EVALSHA`
+(`src/redis/lua/claim.lua`, `src/redis/lua/complete.lua`,
+`src/redis/script-loader.ts`'s `LuaScript`, ported unchanged from
+`RateLimiter/src/limiters/redis/script-loader.ts`):
+
+- **`PENDING` carries a lease** (`leaseMs`, default 30s). A claim past
+  its lease is treated as abandoned and reclaimed automatically —
+  Phase 2's poisoned key self-heals instead of blocking every future
+  retry forever.
+- **A concurrent claim against a live `PENDING`** gets `409 Conflict`
+  with `Retry-After` set from the remaining lease — no more ambiguous
+  `200`.
+- **A claim against `COMPLETED`** replays the stored response verbatim,
+  including the original HTTP status code — a real retry looks
+  identical to the original response.
+- **Request fingerprinting** (`src/fingerprint.ts`, a stable hash of
+  `amount`/`currency`/`customerId`) rejects a key reused with a
+  different body as `422`, independent of what state the key is in —
+  this is what stops a client bug from silently replaying the wrong
+  charge.
+- **A fencing token** per claim attempt (checked by `complete.lua`)
+  closes an ABA hazard the lease alone doesn't: request A claims,
+  crashes, its lease expires, request B reclaims and completes — if A's
+  original attempt somehow resumes and tries to write its own (stale)
+  result afterward, the token no longer matches and the write is a
+  silent no-op instead of clobbering B's fresh `COMPLETED` state.
+- **`FAILED` is retryable, not terminal** — a fresh claim with the same
+  key and matching fingerprint can reclaim and try again. This matches
+  how Stripe actually behaves (a declined charge doesn't permanently
+  burn the idempotency key) and avoids trading the poisoned-key problem
+  for a new one: a terminal `FAILED` would mean a single transient
+  gateway decline locks a customer out of ever completing that payment.
+
+```
+bun test tests/phase3-lifecycle.test.ts
+```
+
 ## Getting started
 
 ```
@@ -103,8 +144,8 @@ curl -X POST localhost:3000/payments \
 ```
 
 - `?strategy=` selects among the registered strategies (`none`, `naive`,
-  `set-nx` so far; more are added as later phases land) or set
-  `IDEMPOTENCY_STRATEGY`.
+  `set-nx`, `lifecycle` so far — `lifecycle` is the default, since it's
+  the fixed version) or set `IDEMPOTENCY_STRATEGY`.
 - `GET /strategies` lists what's available.
 
 ## Project layout
