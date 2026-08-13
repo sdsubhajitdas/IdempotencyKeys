@@ -2,6 +2,7 @@ import { RedisClient } from "bun";
 import { PaymentGateway } from "../src/gateway/payment-gateway";
 import { NoIdempotency } from "../src/strategies/no-idempotency";
 import { NaiveCheckThenSet } from "../src/strategies/naive-check-then-set";
+import { SetNxClaim } from "../src/strategies/set-nx-claim";
 import type { IdempotencyStrategy, PaymentRequest } from "../src/types";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -16,6 +17,7 @@ const redis = new RedisClient(REDIS_URL);
 const strategies: Record<string, IdempotencyStrategy> = {
   none: new NoIdempotency(gateway),
   naive: new NaiveCheckThenSet(redis, gateway, { prefix: "demo:naive" }),
+  "set-nx": new SetNxClaim(redis, gateway, { prefix: "demo:setnx" }),
 };
 
 function isPaymentRequest(value: unknown): value is PaymentRequest {

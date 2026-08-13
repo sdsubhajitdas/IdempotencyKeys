@@ -54,6 +54,35 @@ Fifty concurrent requests with the same key still produce fifty charges
 — the check doesn't help under contention, only against a *sequential*
 retry after the first request has already finished.
 
+## Phase 2 — atomic claim fixes the race, opens two new ones
+
+`src/strategies/set-nx-claim.ts` claims the key atomically with
+`SET key "" NX` *before* charging, closing Phase 1's race — fifty
+concurrent requests now produce exactly one charge. But this phase
+deliberately stores nothing else, which opens two new, real failure
+modes:
+
+- **In-flight duplicate**: a second request against a key that's
+  claimed but not yet resolved has no way to tell "still charging" from
+  "crashed and never will" — it gets back a bare `200` with no charge
+  details to reconcile against. Demonstrated deterministically with an
+  `onClaimed` hook that fires the second request from inside the first
+  request's claim-to-charge window, no timing guesswork required.
+- **Poisoned key**: an injected in-process throw right after the claim
+  (standing in for a crash — not an OS-level kill) leaves the key
+  claimed forever, with no TTL to recover it. Every legitimate retry
+  after that — same key, same customer, genuinely trying again — gets
+  the same ambiguous `200` and never actually charges. The customer can
+  never complete the payment.
+
+```
+bun test tests/phase2-set-nx-claim.test.ts
+```
+
+Both flaws come from the same root cause: claiming and completing are
+two separate writes with nothing connecting them. Phase 3 fixes this
+with a leased, three-state lifecycle instead of a single claim marker.
+
 ## Getting started
 
 ```
@@ -73,8 +102,8 @@ curl -X POST localhost:3000/payments \
   -d '{"amount": 1000, "currency": "usd", "customerId": "cus_1"}'
 ```
 
-- `?strategy=` selects among the registered strategies (`none`, `naive`
-  so far; more are added as later phases land) or set
+- `?strategy=` selects among the registered strategies (`none`, `naive`,
+  `set-nx` so far; more are added as later phases land) or set
   `IDEMPOTENCY_STRATEGY`.
 - `GET /strategies` lists what's available.
 
