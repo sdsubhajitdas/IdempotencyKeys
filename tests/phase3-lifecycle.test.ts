@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it } from "bun:test";
 import type { PaymentResponse } from "../src/types";
 import { PaymentGateway } from "../src/gateway/payment-gateway";
 import { LifecycleRedis } from "../src/strategies/lifecycle";
+import { StaleClaimError } from "../src/errors";
 import { fireConcurrent } from "../harness/fire";
 import { createTestRedis, uniqueKey } from "./helpers/redis-test-client";
 
@@ -83,6 +84,38 @@ describe("LifecycleRedis: the fix", () => {
     const recovered = await healed.handle(key, request);
     expect(recovered.httpStatus).toBe(201);
     expect(gateway.chargeCountFor(key)).toBe(1);
+  });
+
+  it("a slow (not crashed) claimant that outlives its own lease is fenced out and this is surfaced, not swallowed", async () => {
+    const gateway = new PaymentGateway();
+    const key = uniqueKey("phase3-slow-claimant");
+    const request = { amount: 700, currency: "usd", customerId: "cus_slow" };
+    const leaseMs = 100;
+
+    let requestB: Promise<PaymentResponse> | undefined;
+    const strategyA = new LifecycleRedis(redis, gateway, {
+      leaseMs,
+      onClaimed: async () => {
+        // A is slow enough to outlive its own lease before it even
+        // starts charging — not crashed, just slow. By the time A
+        // resumes, B has already reclaimed the (now-abandoned-looking)
+        // key and completed against it.
+        await Bun.sleep(leaseMs + 100);
+        const strategyB = new LifecycleRedis(redis, gateway, { leaseMs });
+        requestB = strategyB.handle(key, request);
+        await requestB;
+      },
+    });
+
+    await expect(strategyA.handle(key, request)).rejects.toThrow(StaleClaimError);
+    const responseB = await requestB!;
+
+    expect(responseB.httpStatus).toBe(201);
+    // Both A and B charged the gateway — a real double charge that a
+    // lease/fencing scheme can detect but cannot prevent, because by
+    // the time fencing rejects A's write, A's charge has already
+    // happened. See README "What this repo does not solve."
+    expect(gateway.chargeCountFor(key)).toBe(2);
   });
 
   it("the same key with a different request body gets 422, independent of state", async () => {

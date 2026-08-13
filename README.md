@@ -89,8 +89,7 @@ with a leased, three-state lifecycle instead of a single claim marker.
 proper state machine — `NEW -> PENDING -> COMPLETED | FAILED` — backed
 by two Lua scripts run atomically via `EVALSHA`
 (`src/redis/lua/claim.lua`, `src/redis/lua/complete.lua`,
-`src/redis/script-loader.ts`'s `LuaScript`, ported unchanged from
-`RateLimiter/src/limiters/redis/script-loader.ts`):
+loaded by `src/redis/script-loader.ts`'s `LuaScript`):
 
 - **`PENDING` carries a lease** (`leaseMs`, default 30s). A claim past
   its lease is treated as abandoned and reclaimed automatically —
@@ -195,27 +194,36 @@ key, per strategy) — the whole series in one table:
 | postgres-transactional   | 1                 |
 
 **Latency overhead vs. baseline**, independent keys (no collisions,
-steady-state cost), swept across concurrency levels:
+steady-state cost), swept across concurrency levels (one representative
+run — absolute numbers vary with machine load, the pattern doesn't):
 
 | strategy               | concurrency | round-trips/req | p50 ms | p95 ms | p99 ms | overhead vs. `none` (p50) |
 | ----------------------- | ----------- | ---------------- | ------ | ------ | ------ | -------------------------- |
 | none                     | 50          | 0.0               | 0.03   | 0.04   | 0.05   | +0.00                       |
-| naive-check-then-set     | 50          | 2.0               | 0.87   | 0.96   | 0.96   | +0.84                       |
-| set-nx-claim             | 50          | 2.0               | 1.20   | 1.21   | 1.21   | +1.17                       |
-| lifecycle (Redis)        | 50          | 2.0               | 1.65   | 1.78   | 1.78   | +1.62                       |
-| postgres-transactional   | 50          | 2.0               | 14.44  | 18.58  | 18.95  | +14.41                      |
+| naive-check-then-set     | 50          | 2.0               | 1.02   | 1.18   | 1.18   | +0.99                       |
+| set-nx-claim             | 50          | 2.0               | 1.05   | 1.07   | 1.08   | +1.02                       |
+| lifecycle (Redis)        | 50          | 2.0               | 2.48   | 2.84   | 2.84   | +2.45                       |
+| postgres-transactional   | 50          | 2.0               | 22.19  | 23.75  | 23.83  | +22.16                      |
 
-Postgres's gap widens with concurrency — its p50 goes from ~2.8ms at
-concurrency 1 to ~14ms at concurrency 50 (transaction/WAL overhead per
-round trip, not more round trips: it stays at 2 round trips/request
-throughout). Redis-backed strategies stay under 2ms even at concurrency
-50. Full sweep (concurrency 1/10/25/50) and the key-growth measurement
-in `bun run compare`'s own output; a captured `bun run bench` snapshot
-(sequential, single-connection ops/sec) is in
-[`bench/RESULTS.md`](bench/RESULTS.md).
+Postgres's gap widens with concurrency (transaction/WAL overhead per
+round trip, not more round trips: it stays at 2 round trips/request at
+every concurrency level). Redis-backed strategies stay in the low
+single-digit milliseconds throughout. Full sweep (concurrency
+1/10/25/50) and the key-growth measurement in `bun run compare`'s own
+output; a captured `bun run bench` snapshot (sequential,
+single-connection ops/sec) is in [`bench/RESULTS.md`](bench/RESULTS.md).
 
-**Key growth**: with default settings, a completed/failed key retains
-for `retentionSec` (24h, matching Stripe's default retention window); a
+**Key growth** (500 unique-key requests per store-backed strategy):
+
+| redis prefix / pg table | keys | approx bytes |
+| ------------------------ | ---- | ------------- |
+| naive-check-then-set      | 500  | ~160 KiB       |
+| set-nx-claim               | 500  | ~152 KiB       |
+| lifecycle (Redis)          | 500  | ~400 KiB       |
+| postgres-transactional     | 500  | ~184 KiB       |
+
+With default settings, a completed/failed key retains for
+`retentionSec` (24h, matching Stripe's default retention window); a
 pending claim self-heals after `leaseMs` (Redis, 30s default) or
 `staleAfterMs` (Postgres, 30s default) regardless of whether it ever
 completes. Nothing here currently caps total key volume within that
@@ -268,6 +276,31 @@ Honest gaps, not papered over — each a candidate for a future post:
   against — isn't eliminated, just narrowed. A GC pause, a slow
   container, or genuine clock skew between nodes sharing the same store
   can still cause a live claim to look stale.
+- **A slow (not crashed) claimant can still cause a real double
+  charge, and fencing can only detect it, not prevent it.** Both
+  `lifecycle.ts` and `postgres-transactional.ts` carry a fencing
+  token so a claim that's been superseded can't silently overwrite a
+  fresher one's result — but "can't silently overwrite" is not the same
+  as "can't happen." If claimant A is merely slow (still genuinely
+  processing, not crashed) and its lease/staleness window elapses before
+  it finishes, claimant B correctly reclaims the now-abandoned-looking
+  key, charges, and completes. When A finally finishes, its own charge
+  has *already happened* — fencing rejects A's write (`StaleClaimError`,
+  thrown instead of returned as a quiet success) so A's stale result
+  can't clobber B's, but it cannot undo A's charge. Two real charges
+  happen. This is a fundamental trade-off in any lease-based
+  self-healing scheme, not a bug specific to this implementation: the
+  same property that lets Phase 3 fix Phase 2's poisoned key (giving up
+  on a claim that looks abandoned) is exactly what makes this possible.
+  Demonstrated deterministically in
+  `tests/phase3-lifecycle.test.ts`/`tests/phase4-postgres.test.ts`'s
+  "slow claimant" tests — both assert the double charge happens *and*
+  that it's surfaced via a thrown error rather than swallowed. Closing
+  this fully needs either a lease long enough to comfortably outlive
+  realistic processing time (reduces likelihood, doesn't eliminate it)
+  or idempotency at the gateway itself (the `claimToken`/`claim_token`
+  passed through as *the gateway's own* idempotency key, so its retry
+  logic — not this repo's — catches the second charge).
 - **Unbounded key growth.** COMPLETED/FAILED keys expire after
   `retentionSec` (24h default, matching Stripe), and PENDING claims
   expire after their lease/staleness window — but this repo doesn't

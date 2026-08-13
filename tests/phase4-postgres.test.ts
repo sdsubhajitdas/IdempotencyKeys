@@ -3,6 +3,7 @@ import type { PaymentResponse } from "../src/types";
 import { PaymentGateway } from "../src/gateway/payment-gateway";
 import { PostgresTransactional } from "../src/strategies/postgres-transactional";
 import { LifecycleRedis } from "../src/strategies/lifecycle";
+import { StaleClaimError } from "../src/errors";
 import { fireConcurrent } from "../harness/fire";
 import { createTestSql, uniqueKey as uniquePgKey } from "./helpers/pg-test-client";
 import { createTestRedis, uniqueKey as uniqueRedisKey } from "./helpers/redis-test-client";
@@ -95,6 +96,42 @@ describe("PostgresTransactional: correctness, mirroring the Redis lifecycle's gu
     const recovered = await retry.handle(key, request);
     expect(recovered.httpStatus).toBe(201);
     expect(gateway.chargeCountFor(key)).toBe(1);
+  });
+
+  it("a slow (not crashed) claimant that outlives its own staleness window is fenced out and this is surfaced, not swallowed", async () => {
+    const sql = await sqlPromise;
+    const gateway = new PaymentGateway();
+    const key = uniquePgKey("phase4-slow-claimant");
+    const request = { amount: 725, currency: "usd", customerId: "cus_slow" };
+    const staleAfterMs = 100;
+
+    let requestB: Promise<PaymentResponse> | undefined;
+    const strategyA = new PostgresTransactional(sql, gateway, {
+      staleAfterMs,
+      onClaimed: async () => {
+        // A is slow enough to outlive its own staleness window before it
+        // even starts charging — not crashed, just slow. By the time A
+        // resumes, B has already reclaimed and completed against the
+        // (now-abandoned-looking) key.
+        await Bun.sleep(staleAfterMs + 100);
+        const strategyB = new PostgresTransactional(sql, gateway, { staleAfterMs });
+        requestB = strategyB.handle(key, request);
+        await requestB;
+      },
+    });
+
+    await expect(strategyA.handle(key, request)).rejects.toThrow(StaleClaimError);
+    const responseB = await requestB!;
+
+    expect(responseB.httpStatus).toBe(201);
+    // Both A and B charged the gateway — the same unpreventable-in-general
+    // double charge as the Redis lifecycle's equivalent test. What the
+    // fencing fix *does* guarantee here: A's fenced-out attempt never
+    // left a phantom row in Postgres's own ledger table — exactly one
+    // charges row exists, matching B's charge, not two.
+    expect(gateway.chargeCountFor(key)).toBe(2);
+    const chargesRows = await sql`SELECT * FROM charges WHERE idempotency_key = ${key}`;
+    expect(chargesRows.length).toBe(1);
   });
 });
 

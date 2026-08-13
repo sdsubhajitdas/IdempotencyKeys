@@ -7,9 +7,6 @@ import type { RedisClient } from "bun";
  * command interleaves). The script is loaded into Redis's script cache
  * lazily on first use and reloaded automatically if the cache was flushed
  * (a NOSCRIPT reply) — e.g. after a Redis restart.
- *
- * Ported from RateLimiter/src/limiters/redis/script-loader.ts — same
- * pattern, same reasoning, no changes.
  */
 export class LuaScript {
   private readonly sha: string;

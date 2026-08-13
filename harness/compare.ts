@@ -108,45 +108,56 @@ async function runCollisionAudit(entries: Entry[]): Promise<void> {
   printTable(["strategy", `charges (of ${COLLISION_CONCURRENCY} requests)`], rows);
 }
 
+async function runOneLevel(entry: Entry, level: number): Promise<{ p50: number; p95: number; p99: number; roundTrips: number }> {
+  entry.gateway.reset();
+  const request = { amount: 500, currency: "usd", customerId: "cus_sweep" };
+  const before = entry.instrumented.metrics;
+  const startingRoundTrips = before.storeRoundTrips;
+  const startingCalls = before.calls;
+
+  await Promise.all(
+    Array.from({ length: level }, () =>
+      entry.instrumented.handle(`sweep:${entry.name}:${crypto.randomUUID()}`, request),
+    ),
+  );
+
+  const metrics = entry.instrumented.metrics;
+  const latencies = metrics.latenciesMs.slice(startingCalls).sort((a, b) => a - b);
+  return {
+    p50: percentile(latencies, 0.5),
+    p95: percentile(latencies, 0.95),
+    p99: percentile(latencies, 0.99),
+    roundTrips: metrics.storeRoundTrips - startingRoundTrips,
+  };
+}
+
 async function runLatencySweep(entries: Entry[]): Promise<void> {
   console.log("\n=== Latency + round-trips by concurrency level (independent keys) ===\n");
 
-  const baselineP50: Record<number, number> = {};
+  const baseline = entries.find((e) => e.name === "none");
+  if (!baseline) {
+    throw new Error("runLatencySweep requires a 'none' entry to compute overhead against");
+  }
+
   const rows: string[][] = [];
 
   for (const level of CONCURRENCY_LEVELS) {
+    // Run the baseline first at each level so every other strategy's
+    // overhead is computed against an explicit, already-known number —
+    // not against whatever happened to run earlier in the loop.
+    const baselineResult = await runOneLevel(baseline, level);
+
     for (const entry of entries) {
-      entry.gateway.reset();
-      const request = { amount: 500, currency: "usd", customerId: "cus_sweep" };
-      const before = entry.instrumented.metrics;
-      const startingRoundTrips = before.storeRoundTrips;
-      const startingCalls = before.calls;
-
-      await Promise.all(
-        Array.from({ length: level }, () =>
-          entry.instrumented.handle(`sweep:${entry.name}:${crypto.randomUUID()}`, request),
-        ),
-      );
-
-      const metrics = entry.instrumented.metrics;
-      const latencies = metrics.latenciesMs.slice(startingCalls).sort((a, b) => a - b);
-      const roundTrips = metrics.storeRoundTrips - startingRoundTrips;
-      const p50 = percentile(latencies, 0.5);
-      const p95 = percentile(latencies, 0.95);
-      const p99 = percentile(latencies, 0.99);
-
-      if (entry.name === "none") {
-        baselineP50[level] = p50;
-      }
-      const overheadMs = p50 - (baselineP50[level] ?? p50);
+      const result = entry === baseline ? baselineResult : await runOneLevel(entry, level);
+      const overheadMs = result.p50 - baselineResult.p50;
 
       rows.push([
         entry.name,
         String(level),
-        (roundTrips / level).toFixed(1),
-        p50.toFixed(2),
-        p95.toFixed(2),
-        p99.toFixed(2),
+        (result.roundTrips / level).toFixed(1),
+        result.p50.toFixed(2),
+        result.p95.toFixed(2),
+        result.p99.toFixed(2),
         `+${overheadMs.toFixed(2)}`,
       ]);
     }
@@ -191,14 +202,20 @@ async function runKeyGrowth(entries: Entry[]): Promise<void> {
   }
 
   const sql = createSql();
+  // pg_column_size(t.*) summed over just this run's rows, so the byte
+  // figure is scoped the same way the count and the Redis rows above it
+  // are — pg_total_relation_size() would report the whole table
+  // (including every previous run's rows still inside their retention
+  // window) next to a count filtered down to just this run's, which
+  // isn't a comparable pair.
   const [pgRow] = await sql<{ count: string; bytes: string }[]>`
-    SELECT count(*)::text AS count, pg_total_relation_size('idempotency_keys')::text AS bytes
-    FROM idempotency_keys WHERE key LIKE ${`growth:${runId}:postgres-transactional:%`}
+    SELECT count(*)::text AS count, COALESCE(SUM(pg_column_size(t.*)), 0)::text AS bytes
+    FROM idempotency_keys t WHERE key LIKE ${`growth:${runId}:postgres-transactional:%`}
   `;
   rows.push([
-    "postgres idempotency_keys (this run's rows)",
+    "postgres idempotency_keys",
     pgRow?.count ?? "0",
-    `${(Number(pgRow?.bytes ?? 0) / 1024).toFixed(1)} KiB (whole table)`,
+    `${(Number(pgRow?.bytes ?? 0) / 1024).toFixed(1)} KiB`,
   ]);
 
   printTable(["redis prefix / pg table", "keys", "approx bytes"], rows);

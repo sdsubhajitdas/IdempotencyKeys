@@ -46,9 +46,7 @@ strategy-specific branching — see the `?strategy=` switch in
 demonstrating the failure mode that motivates the next phase:
 - `no-idempotency.ts` — Phase 0: no protection, charges every time.
 - `naive-check-then-set.ts` — Phase 1: `GET`-then-`SET`, still races.
-  Do not "fix" this one; being broken is its purpose (mirrors
-  `RateLimiter/src/limiters/naive/fixed-window-naive-redis.ts`'s role in
-  the prior repo).
+  Do not "fix" this one; being broken under concurrency is its purpose.
 - `set-nx-claim.ts` — Phase 2: atomic claim via `SET NX`, but no result
   storage and no TTL — fixes the double-charge race but introduces the
   in-flight-duplicate and poisoned-key problems. Also deliberately not
@@ -67,11 +65,25 @@ duplicate-charge assertion in the test suite reads
 `gateway.chargeCountFor(key)` / `gateway.ledger` directly — nothing is
 inferred from a strategy's return value.
 
+**Fencing detects, does not prevent** (`src/errors.ts`): both
+`lifecycle.ts`'s `persistCompletion` and `postgres-transactional.ts`'s
+`persist` check whether their claim token is still current before
+writing a completed result, and throw `StaleClaimError` instead of
+returning success when it isn't. A claim can be superseded this way
+without ever crashing — a claimant that's merely slow enough to outlive
+its own lease/staleness window gets reclaimed by someone else, and by
+the time the slow claimant tries to persist, it's already charged the
+gateway. Fencing stops that stale write from corrupting the newer
+claim's state (and, in Postgres, stops a phantom row from landing in
+`charges`), but it cannot undo the charge that already happened — see
+`tests/phase3-lifecycle.test.ts`/`tests/phase4-postgres.test.ts`'s "slow
+claimant" tests and README "What this repo does not solve."
+
 **Redis atomicity** (`src/redis/`): `script-loader.ts`'s `LuaScript`
-class is ported from `RateLimiter/src/limiters/redis/script-loader.ts` —
-SHA1 the script locally, lazy `SCRIPT LOAD`, `EVALSHA` via `.send()`,
-catch `NOSCRIPT` and reload. `Bun.redis`'s `RedisClient` does not wrap
-`EVAL`/`EVALSHA` directly (confirmed against `bun-types@1.3.14`), which
+class SHA1s the script locally, lazily runs `SCRIPT LOAD`, then calls
+`EVALSHA` via `.send()`, catching `NOSCRIPT` and reloading once.
+`Bun.redis`'s `RedisClient` does not wrap `EVAL`/`EVALSHA` directly
+(confirmed against `bun-types@1.3.14`), which
 is why this fallback exists at all.
 
 **Determinism**: nothing in this repo depends on winning a real timing
@@ -114,9 +126,9 @@ for this repo's own concurrency rather than Bun's default of 10.
   `noImplicitOverride`, `exactOptionalPropertyTypes`) — respect these
   rather than loosening them for convenience.
 - Lua files are imported as text (`... with { type: "text" }`, see
-  `types/lua.d.ts`), same as the prior repo — no separate build step.
-- All tests live in one `tests/` directory (`bun test tests/`), not split
-  into a separate "naive" suite the way `RateLimiter` did — this whole
-  repo is a naive-to-fixed progression, so the deliberately-broken phases
-  (0-2) are as central to the suite as the fixed one (3-4), not a side
-  note run separately.
+  `types/lua.d.ts`) — no separate build step.
+- All tests live in one `tests/` directory (`bun test tests/`), not
+  split into a separate "naive" suite — this whole repo is a
+  naive-to-fixed progression, so the deliberately-broken phases (0-2)
+  are as central to the suite as the fixed one (3-4), not a side note
+  run separately.

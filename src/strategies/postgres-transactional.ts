@@ -2,6 +2,7 @@ import type { SQL } from "bun";
 import type { ChargeResult, PaymentGateway } from "../gateway/payment-gateway";
 import type { IdempotencyStrategy, PaymentRequest, PaymentResponse } from "../types";
 import { fingerprintRequest } from "../fingerprint";
+import { StaleClaimError } from "../errors";
 
 export interface PostgresTransactionalOptions {
   /** How long a pending claim is considered abandoned and reclaimable. Default 30s, mirroring the Redis lease. */
@@ -230,6 +231,18 @@ export class PostgresTransactional implements IdempotencyStrategy {
     return { claimed: true };
   }
 
+  /**
+   * Completes the claim and, if there's a charge, records it — in one
+   * transaction, fenced on claim_token still matching. The fencing check
+   * runs *first*: if the UPDATE affects zero rows, our claim was already
+   * superseded (its staleness window elapsed and someone else reclaimed
+   * the key), so we throw before the charges INSERT ever runs — rolling
+   * back the whole transaction rather than leaving a phantom charges row
+   * whose idempotency_key was already claimed by someone else's attempt.
+   * By this point the gateway charge (if any) already happened and can't
+   * be undone; throwing makes that visible instead of silently returning
+   * success. See StaleClaimError.
+   */
   private async persist(
     key: string,
     claimToken: string,
@@ -238,17 +251,22 @@ export class PostgresTransactional implements IdempotencyStrategy {
     charge?: ChargeResult,
   ): Promise<void> {
     await this.sql.begin(async (tx) => {
+      const updated = await tx<IdempotencyRow[]>`
+        UPDATE idempotency_keys
+        SET status = ${status}, response_status = ${response.httpStatus}, response_body = ${JSON.stringify(response.body)}, completed_at = now()
+        WHERE key = ${key} AND claim_token = ${claimToken}
+        RETURNING *
+      `;
+      if (updated.length === 0) {
+        throw new StaleClaimError(key);
+      }
+
       if (charge) {
         await tx`
           INSERT INTO charges (id, idempotency_key, amount, currency)
           VALUES (${charge.chargeId}, ${key}, ${charge.amount}, ${charge.currency})
         `;
       }
-      await tx`
-        UPDATE idempotency_keys
-        SET status = ${status}, response_status = ${response.httpStatus}, response_body = ${JSON.stringify(response.body)}, completed_at = now()
-        WHERE key = ${key} AND claim_token = ${claimToken}
-      `;
     });
   }
 }

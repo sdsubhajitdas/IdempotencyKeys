@@ -11,8 +11,8 @@ import type { IdempotencyStrategy } from "../src/types";
 // Sequential (not concurrent) round trips, one connection per store:
 // this measures per-call latency and single-connection throughput, not
 // maximum achievable throughput under pipelining/multiple connections.
-// Mirrors RateLimiter/bench/run.ts's methodology — the point is a
-// same-shape comparison across strategies, not an absolute ceiling.
+// The point is a same-shape comparison across strategies, not an
+// absolute ceiling — see harness/compare.ts for concurrent behavior.
 const ITERATIONS = 1000;
 const WARMUP = 100;
 

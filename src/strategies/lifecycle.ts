@@ -2,6 +2,7 @@ import type { RedisClient } from "bun";
 import type { PaymentGateway } from "../gateway/payment-gateway";
 import type { IdempotencyStrategy, PaymentRequest, PaymentResponse } from "../types";
 import { fingerprintRequest } from "../fingerprint";
+import { StaleClaimError } from "../errors";
 import { LuaScript } from "../redis/script-loader";
 import claimLua from "../redis/lua/claim.lua" with { type: "text" };
 import completeLua from "../redis/lua/complete.lua" with { type: "text" };
@@ -43,8 +44,8 @@ const completeScript = new LuaScript(completeLua);
 
 /**
  * The fix: NEW -> PENDING -> COMPLETED|FAILED, atomic via Lua
- * (claim.lua / complete.lua, run through EVALSHA with the RateLimiter
- * repo's LuaScript/NOSCRIPT-reload pattern). PENDING carries a lease so
+ * (claim.lua / complete.lua, run through EVALSHA via LuaScript's
+ * NOSCRIPT-reload pattern). PENDING carries a lease so
  * a crash self-heals instead of poisoning the key; a concurrent claim
  * against a live PENDING gets 409 + Retry-After; a claim against
  * COMPLETED replays the stored response verbatim; a fingerprint mismatch
@@ -121,11 +122,7 @@ export class LifecycleRedis implements IdempotencyStrategy {
     let response: PaymentResponse;
     if (this.injectChargeFailure) {
       response = { httpStatus: 402, body: { status: "failed", error: "simulated gateway decline" } };
-      await completeScript.run(
-        this.redis,
-        [redisKey],
-        [claimToken, "FAILED", response.httpStatus, JSON.stringify(response.body), this.retentionSec],
-      );
+      await this.persistCompletion(redisKey, key, claimToken, "FAILED", response);
       return response;
     }
 
@@ -144,12 +141,34 @@ export class LifecycleRedis implements IdempotencyStrategy {
       throw new Error("simulated failure between charge success and persisting the result");
     }
 
-    await completeScript.run(
+    await this.persistCompletion(redisKey, key, claimToken, "COMPLETED", response);
+    return response;
+  }
+
+  /**
+   * Runs complete.lua and checks its reply. A "STALE" reply means this
+   * claim's lease expired and someone else reclaimed the key before we
+   * got here — complete.lua correctly refused to overwrite their fresher
+   * state, but by this point we've already charged the gateway (for the
+   * COMPLETED case) or already told the caller their decline was final
+   * (for FAILED). Silently returning success here would hide a real
+   * double charge; throwing makes it visible instead. See StaleClaimError.
+   */
+  private async persistCompletion(
+    redisKey: string,
+    key: string,
+    claimToken: string,
+    newState: "COMPLETED" | "FAILED",
+    response: PaymentResponse,
+  ): Promise<void> {
+    const [outcome] = (await completeScript.run(
       this.redis,
       [redisKey],
-      [claimToken, "COMPLETED", response.httpStatus, JSON.stringify(response.body), this.retentionSec],
-    );
+      [claimToken, newState, response.httpStatus, JSON.stringify(response.body), this.retentionSec],
+    )) as ["OK"] | ["STALE"];
 
-    return response;
+    if (outcome === "STALE") {
+      throw new StaleClaimError(key);
+    }
   }
 }
