@@ -1,4 +1,4 @@
-# idempotency-keys-from-scratch
+# Idempotency Keys
 
 Idempotency keys for a payment API, built from a broken baseline up to a
 tested, working implementation — for the blog series **"From Theory to

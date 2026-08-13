@@ -1,5 +1,5 @@
 {
-  "name": "idempotency-keys-from-scratch",
+  "name": "idempotency-keys",
   "version": "1.0.0",
   "private": true,
   "description": "Idempotency keys for payment APIs, built from a broken baseline up to a tested three-state Redis lifecycle and an honest Postgres comparison.",
