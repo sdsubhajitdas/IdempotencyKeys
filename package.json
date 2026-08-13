@@ -1,0 +1,23 @@
+{
+  "name": "idempotency-keys-from-scratch",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Idempotency keys for payment APIs, built from a broken baseline up to a tested three-state Redis lifecycle and an honest Postgres comparison.",
+  "type": "module",
+  "engines": {
+    "bun": ">=1.3"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test tests/ --timeout 15000",
+    "test:watch": "bun test tests/ --timeout 15000 --watch",
+    "demo": "bun run demo/server.ts",
+    "dev": "bun --hot demo/server.ts",
+    "compare": "bun run harness/compare.ts",
+    "bench": "bun run bench/run.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "typescript": "5.9.3"
+  }
+}

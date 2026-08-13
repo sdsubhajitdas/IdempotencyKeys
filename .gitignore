@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+*.log
+.env
+bench/results/*.csv
+.DS_Store
+.claude
