@@ -35,6 +35,25 @@ processor that actually records every charge it's asked to make, with a
 `ledger` every later test reads directly to answer "did we double-charge
 the customer?" — never inferred from a strategy's return value.
 
+## Phase 1 — naive check-then-set still races
+
+`src/strategies/naive-check-then-set.ts` adds the fix everyone writes
+first: `GET` the key, and if it's absent, charge and `SET` the result
+back. It still double-charges under concurrency — every caller's `GET`
+can observe "absent" before any writer's `SET` lands, because there's no
+atomicity between the read and the write. `raceWindowMs` widens that gap
+deliberately (an artificial delay between the `GET` and the charge) so
+the race reproduces on every run instead of depending on real Redis
+round-trip variance:
+
+```
+bun test tests/phase1-naive-check-then-set.test.ts
+```
+
+Fifty concurrent requests with the same key still produce fifty charges
+— the check doesn't help under contention, only against a *sequential*
+retry after the first request has already finished.
+
 ## Getting started
 
 ```
@@ -54,8 +73,9 @@ curl -X POST localhost:3000/payments \
   -d '{"amount": 1000, "currency": "usd", "customerId": "cus_1"}'
 ```
 
-- `?strategy=` selects among the registered strategies (`none` for now;
-  more are added as later phases land) or set `IDEMPOTENCY_STRATEGY`.
+- `?strategy=` selects among the registered strategies (`none`, `naive`
+  so far; more are added as later phases land) or set
+  `IDEMPOTENCY_STRATEGY`.
 - `GET /strategies` lists what's available.
 
 ## Project layout
